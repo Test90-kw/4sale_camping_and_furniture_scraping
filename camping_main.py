@@ -1,34 +1,51 @@
-import asyncio
-import pandas as pd
-import os
-import json
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
-from pathlib import Path
-from DetailsScraper import DetailsScraping
-from SavingOnDriveCamping import SavingOnDriveCamping
+# Import necessary modules
+import asyncio  # For running async operations
+import pandas as pd  # For handling dataframes and Excel writing
+import os  # For file operations and environment variables
+import json  # For parsing JSON credentials
+import logging  # For logging events and errors
+from datetime import datetime, timedelta  # For date/time calculations
+from typing import Dict, List, Tuple  # Type hints for dictionaries and lists
+from pathlib import Path  # For file path management
+from DetailsScraper import DetailsScraping  # Custom class to scrape individual detail pages
+from SavingOnDriveCamping import SavingOnDriveCamping  # Custom class for Google Drive operations
 
 
+# Main class to handle camping data scraping and uploading
 class CampingMainScraper:
     def __init__(self, campings_data: Dict[str, List[Tuple[str, int]]]):
+        # Store camping data: dict of category names to list of (URL, page count)
         self.campings_data = campings_data
+
+        # Define how many categories to scrape in parallel (chunks)
         self.chunk_size = 2
+
+        # Max concurrent page requests per chunk
         self.max_concurrent_links = 2
+
+        # Create a logger instance
         self.logger = logging.getLogger(__name__)
-        self.setup_logging()
+        self.setup_logging()  # Set up logging output
+
+        # Directory to store temporary files (Excel)
         self.temp_dir = Path("temp_files")
         self.temp_dir.mkdir(exist_ok=True)
+
+        # Retry parameters for file upload
         self.upload_retries = 3
-        self.upload_retry_delay = 15
-        self.page_delay = 3
-        self.chunk_delay = 10
+        self.upload_retry_delay = 15  # seconds
+
+        # Delay settings
+        self.page_delay = 3  # Between pages
+        self.chunk_delay = 10  # Between chunks
 
     def setup_logging(self):
         """Initialize logging configuration."""
+        # Log to both console and file
         stream_handler = logging.StreamHandler()
         file_handler = logging.FileHandler("scraper.log")
 
+        # Set logging format and level
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s",
@@ -41,20 +58,23 @@ class CampingMainScraper:
         """Scrape data for a single category."""
         self.logger.info(f"Starting to scrape {camping_name}")
         card_data = []
+
+        # Determine yesterday's date
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
+        # Limit concurrent access using semaphore
         async with semaphore:
             for url_template, page_count in urls:
                 for page in range(1, page_count + 1):
-                    url = url_template.format(page)
+                    url = url_template.format(page)  # Format URL with page number
                     scraper = DetailsScraping(url)
                     try:
-                        cards = await scraper.get_card_details()
+                        cards = await scraper.get_card_details()  # Get card listings
                         for card in cards:
+                            # Only save cards posted yesterday
                             if card.get("date_published") and card.get("date_published", "").split()[0] == yesterday:
                                 card_data.append(card)
-
-                        await asyncio.sleep(self.page_delay)
+                        await asyncio.sleep(self.page_delay)  # Delay between pages
                     except Exception as e:
                         self.logger.error(f"Error scraping {url}: {e}")
                         continue
@@ -67,12 +87,13 @@ class CampingMainScraper:
             self.logger.info(f"No data to save for {camping_name}, skipping Excel file creation.")
             return None
 
-        # Sanitize filename by replacing invalid characters
+        # Make filename safe by removing problematic characters
         safe_name = camping_name.replace('/', '_').replace('\\', '_')
         excel_file = Path(f"{safe_name}.xlsx")
+
         try:
-            df = pd.DataFrame(card_data)
-            df.to_excel(excel_file, index=False)
+            df = pd.DataFrame(card_data)  # Convert to DataFrame
+            df.to_excel(excel_file, index=False)  # Save as Excel
             self.logger.info(f"Successfully saved data for {camping_name}")
             return str(excel_file)
         except Exception as e:
@@ -88,7 +109,8 @@ class CampingMainScraper:
             self.logger.info(f"Checking local files before upload: {files}")
             for file in files:
                 self.logger.info(f"File {file} exists: {os.path.exists(file)}, size: {os.path.getsize(file) if os.path.exists(file) else 'N/A'}")
- 
+
+            # Ensure the destination folder exists
             folder_id = drive_saver.get_folder_id(yesterday)
             if not folder_id:
                 self.logger.info(f"Creating new folder for date: {yesterday}")
@@ -97,6 +119,7 @@ class CampingMainScraper:
                     raise Exception("Failed to create or get folder ID")
                 self.logger.info(f"Created new folder '{yesterday}' with ID: {folder_id}")
 
+            # Upload each file with retries
             for file in files:
                 for attempt in range(self.upload_retries):
                     try:
@@ -124,12 +147,12 @@ class CampingMainScraper:
             raise
 
         return uploaded_files
-    
+
     async def scrape_all_campings(self):
         """Scrape all categories and handle uploads."""
         self.temp_dir.mkdir(exist_ok=True)
 
-        # Setup Google Drive
+        # Set up Google Drive authentication
         try:
             credentials_json = os.environ.get("CAMPINGS_GCLOUD_KEY_JSON")
             if not credentials_json:
@@ -142,6 +165,7 @@ class CampingMainScraper:
             drive_saver.authenticate()
             self.logger.info("Testing Drive API access...")
             try:
+                # Test access to the parent folder
                 drive_saver.service.files().get(fileId=drive_saver.parent_folder_id).execute()
                 self.logger.info("Successfully accessed parent folder")
             except Exception as e:
@@ -151,13 +175,16 @@ class CampingMainScraper:
             self.logger.error(f"Failed to setup Google Drive: {e}")
             return
 
+        # Split all categories into chunks of 2 for processing
         campings_chunks = [
             list(self.campings_data.items())[i : i + self.chunk_size]
             for i in range(0, len(self.campings_data), self.chunk_size)
         ]
 
+        # Semaphore to control concurrency
         semaphore = asyncio.Semaphore(self.max_concurrent_links)
 
+        # Process each chunk
         for chunk_index, chunk in enumerate(campings_chunks, 1):
             self.logger.info(f"Processing chunk {chunk_index}/{len(campings_chunks)}")
 
@@ -165,7 +192,7 @@ class CampingMainScraper:
             for camping_name, urls in chunk:
                 task = asyncio.create_task(self.scrape_camping(camping_name, urls, semaphore))
                 tasks.append((camping_name, task))
-                await asyncio.sleep(2)
+                await asyncio.sleep(2)  # Short delay between starting tasks
 
             pending_uploads = []
             for camping_name, task in tasks:
@@ -178,6 +205,7 @@ class CampingMainScraper:
                 except Exception as e:
                     self.logger.error(f"Error processing {camping_name}: {e}")
 
+            # Upload files and delete locally after upload
             if pending_uploads:
                 await self.upload_files_with_retry(drive_saver, pending_uploads)
 
@@ -192,8 +220,8 @@ class CampingMainScraper:
                 self.logger.info(f"Waiting {self.chunk_delay} seconds before next chunk...")
                 await asyncio.sleep(self.chunk_delay)
 
-
 if __name__ == "__main__":
+    # Define all camping categories and URLs with number of pages to scrape
     campings_data = {
         "نطاطيات": [("https://www.q84sale.com/ar/camping/trampoline-for-rent/{}", 2)],
         "أغراض المخيمات": [("https://www.q84sale.com/ar/camping/camping-stuff/{}", 5)],
